@@ -4,3 +4,4 @@ outputs/
 *.pkl
 __pycache__/
 .streamlit/secrets.toml
+context
