@@ -43,7 +43,7 @@ FEATURE_COLS = [
 ]
 
 RANDOM_STATE  = 42
-DBSCAN_SAMPLE = 20_000   # DBSCAN distance matrix is O(n²) — sample to avoid OOM
+DBSCAN_SAMPLE = 10_000   # DBSCAN distance matrix is O(n²) — sample to avoid OOM
 
 
 def load_data(path: str):

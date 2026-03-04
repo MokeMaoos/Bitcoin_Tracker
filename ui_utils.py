@@ -1,5 +1,11 @@
 """
 ui_utils.py — shared data loading, caching, and helper functions for the Streamlit UI.
+
+External integrations:
+  - Mempool.space API  (no key needed)   → enrich tx with fee/size/timing
+  - Bitcoin Abuse DB   (free key)        → flag addresses with abuse reports
+  - Claude API         (Anthropic key)   → generate natural-language risk analysis
+  - Elliptic dataset   (Kaggle download) → ground-truth benchmark evaluation
 """
 
 import os
@@ -272,3 +278,202 @@ def run_live_prediction(block_no, trans_no, td, tx, ai, wi, bundle):
     X      = feat_df[fcols].fillna(feat_df[fcols].median())
     prob   = float(model.predict_proba(X)[0][1])
     return feat, prob
+
+
+# ── External API helpers ───────────────────────────────────────────────────────
+
+def _get_secret(key: str) -> str:
+    """Read a key from Streamlit secrets or environment variables."""
+    try:
+        import streamlit as _st
+        val = _st.secrets.get(key, "")
+    except Exception:
+        val = ""
+    return val or os.environ.get(key, "")
+
+
+# ── Mempool.space (no key required) ───────────────────────────────────────────
+
+def fetch_mempool_tx(trans_no: str) -> dict | None:
+    """
+    Fetch live transaction data from Mempool.space.
+    Returns a dict with fee, size, vsize, weight, fee_rate, status fields.
+    Returns None on failure (network error / tx not found).
+    """
+    import requests
+    try:
+        r = requests.get(
+            f"https://mempool.space/api/tx/{trans_no}",
+            timeout=6,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            fee  = data.get("fee", 0)
+            vsz  = data.get("vsize") or data.get("size", 1)
+            return {
+                "fee_sats":        fee,
+                "fee_btc":         fee / 1e8,
+                "fee_rate_sat_vb": round(fee / max(vsz, 1), 2),
+                "size_bytes":      data.get("size"),
+                "vsize_vbytes":    data.get("vsize"),
+                "weight":          data.get("weight"),
+                "version":         data.get("version"),
+                "locktime":        data.get("locktime"),
+                "vin_count":       len(data.get("vin", [])),
+                "vout_count":      len(data.get("vout", [])),
+                "confirmed":       data.get("status", {}).get("confirmed", False),
+                "block_height":    data.get("status", {}).get("block_height"),
+                "block_time":      data.get("status", {}).get("block_time"),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def fetch_mempool_address(address: str) -> dict | None:
+    """Fetch address summary from Mempool.space (tx count, balance)."""
+    import requests
+    try:
+        r = requests.get(
+            f"https://mempool.space/api/address/{address}",
+            timeout=6,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            chain = data.get("chain_stats", {})
+            return {
+                "tx_count":       chain.get("tx_count", 0),
+                "funded_sum":     chain.get("funded_txo_sum", 0) / 1e8,
+                "spent_sum":      chain.get("spent_txo_sum", 0) / 1e8,
+                "funded_count":   chain.get("funded_txo_count", 0),
+                "spent_count":    chain.get("spent_txo_count", 0),
+            }
+    except Exception:
+        pass
+    return None
+
+
+# ── Bitcoin Abuse DB ───────────────────────────────────────────────────────────
+
+def check_bitcoin_abuse(address: str, api_key: str = "") -> dict | None:
+    """
+    Check a Bitcoin address against the Bitcoin Abuse database.
+    Returns dict with 'count' and 'recent' report list, or None on failure.
+    Register for a free API key at: https://www.bitcoinabuse.com/api-docs
+    """
+    import requests
+    key = api_key or _get_secret("BITCOIN_ABUSE_KEY")
+    if not key:
+        return None
+    try:
+        r = requests.get(
+            "https://www.bitcoinabuse.com/api/reports/check",
+            params={"address": address, "api_token": key},
+            timeout=6,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def check_addresses_abuse(addresses: list[str], api_key: str = "") -> dict:
+    """
+    Check multiple addresses. Returns {address: abuse_result} dict.
+    Skips blanks and NaN values. Results cached in session_state.
+    """
+    results = {}
+    key = api_key or _get_secret("BITCOIN_ABUSE_KEY")
+    if not key:
+        return results
+    for addr in addresses:
+        if not addr or str(addr) == "nan":
+            continue
+        result = check_bitcoin_abuse(str(addr), key)
+        if result is not None:
+            results[str(addr)] = result
+    return results
+
+
+# ── Claude AI Analysis ─────────────────────────────────────────────────────────
+
+def generate_claude_analysis(
+    feat_row: dict,
+    rules: dict,
+    prob: float,
+    block_no: int,
+    trans_no: str,
+    api_key: str = "",
+) -> str:
+    """
+    Call Claude API to generate a natural-language forensic risk analysis.
+    Returns the analysis text, or an error message string.
+
+    Set ANTHROPIC_API_KEY in .streamlit/secrets.toml or as an environment variable.
+    """
+    import anthropic
+
+    key = api_key or _get_secret("ANTHROPIC_API_KEY")
+    if not key:
+        return "❌ No Anthropic API key configured. Add ANTHROPIC_API_KEY to .streamlit/secrets.toml"
+
+    fired     = [RULE_META[k]["label"] for k, v in rules.items() if v and k in RULE_META]
+    not_fired = [RULE_META[k]["label"] for k, v in rules.items() if not v and k in RULE_META]
+    score     = sum(1 for v in rules.values() if v)
+    pred      = "ILLICIT" if prob >= 0.5 else "LICIT"
+
+    prompt = f"""You are a blockchain forensics expert specialising in Bitcoin AML (Anti-Money Laundering) compliance, with deep knowledge of FATF guidance and common illicit transaction patterns (CoinJoin mixing, peeling chains, darknet market payments, ransomware, structuring, layering).
+
+Analyse the following Bitcoin transaction and provide a professional risk assessment:
+
+TRANSACTION
+  Block:  {block_no}
+  Hash:   {trans_no}
+  Model verdict: {pred}  ({prob:.1%} illicit probability)
+  Suspicion score: {score}/6 rules fired
+
+FATF RED-FLAG RULES
+  Fired ({len(fired)}):     {', '.join(fired) if fired else 'None'}
+  Not fired ({len(not_fired)}): {', '.join(not_fired) if not_fired else 'None'}
+
+FEATURE VALUES
+  Inputs:             {int(feat_row.get('num_inputs', 0))} addresses  |  Total in:  {float(feat_row.get('total_input', 0) or 0):.6f} BTC
+  Outputs:            {int(feat_row.get('num_outputs', 0))} addresses  |  Total out: {float(feat_row.get('total_output', 0) or 0):.6f} BTC
+  I/O address ratio:  {float(feat_row.get('io_ratio', 0) or 0):.3f}
+  Value entropy:      {float(feat_row.get('value_entropy', 0) or 0):.3f} bits  (≥3.0 = anomalous)
+  CoinJoin strength:  {float(feat_row.get('coinjoin_strength', 0) or 0):.4f}  (≥0.5 = mixing signal)
+  Equal-value flag:   {'Yes' if feat_row.get('equal_value_flag') else 'No'}
+  Peeling chain flag: {'Yes' if feat_row.get('peeling_flag') else 'No'}
+  Std of outputs:     {float(feat_row.get('std_output', 0) or 0):.6f} BTC
+  Max output:         {float(feat_row.get('max_output', 0) or 0):.6f} BTC  ({float(feat_row.get('max_output', 0) or 0) / max(float(feat_row.get('total_output', 1e-9) or 1e-9), 1e-9):.1%} of total)
+
+Provide your analysis in exactly these four sections (use these headings):
+
+**PATTERN**
+What transaction pattern does this most resemble? Name the specific pattern type (e.g. CoinJoin mix, peel chain, exchange consolidation, darknet settlement, ransomware payout, structuring). Cite the specific features that lead you to this conclusion.
+
+**RISK SYNTHESIS**
+Synthesise all signals. Which features are most diagnostic and why? Does the combination of signals strengthen or weaken the case for illicit activity? Are there innocent explanations for these patterns?
+
+**RECOMMENDED ACTION**
+What should a compliance analyst do next? Be specific (e.g. trace input addresses, check against OFAC SDN list, file SAR, escalate to senior analyst).
+
+**CAVEATS**
+What additional information would materially change this assessment? What are the limitations of rule-based detection for this type of pattern?
+"""
+
+    try:
+        client  = anthropic.Anthropic(api_key=key)
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text
+    except anthropic.AuthenticationError:
+        return "❌ Invalid Anthropic API key. Check ANTHROPIC_API_KEY in .streamlit/secrets.toml"
+    except anthropic.RateLimitError:
+        return "❌ Anthropic rate limit reached. Please wait a moment and try again."
+    except Exception as e:
+        return f"❌ Claude API error: {e}"

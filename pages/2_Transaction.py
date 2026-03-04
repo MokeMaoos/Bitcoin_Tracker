@@ -9,6 +9,9 @@ Shows:
   - Raw inputs/outputs table
   - Cluster assignment
   - Wallet summary + link to wallet page
+  - External: Mempool.space live data (fee, size, timing)
+  - External: Bitcoin Abuse DB address reports
+  - External: Claude AI natural-language forensic analysis
 """
 
 import os
@@ -23,7 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ui_utils import (
     load_labeled, load_clusters, load_model_bundle, load_raw,
     run_live_prediction, rule_evidence, derive_rules,
-    RULE_META, LABEL_MAP, LABEL_COLORS,
+    fetch_mempool_tx, check_addresses_abuse, generate_claude_analysis,
+    RULE_META, LABEL_MAP, LABEL_COLORS, _get_secret,
 )
 
 st.set_page_config(
@@ -280,3 +284,148 @@ if wallet_id is not None:
     if st.button("View Full Wallet Analysis →"):
         st.session_state["sel_wallet"] = str(wallet_id)
         st.switch_page("pages/3_Wallet.py")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTERNAL DATA SOURCES
+# ══════════════════════════════════════════════════════════════════════════════
+st.divider()
+st.subheader("🌐  External Data Sources")
+
+ext_tab1, ext_tab2, ext_tab3 = st.tabs([
+    "📡  Mempool.space",
+    "🚨  Bitcoin Abuse DB",
+    "🤖  Claude AI Analysis",
+])
+
+# ── Tab 1: Mempool.space ──────────────────────────────────────────────────────
+with ext_tab1:
+    st.caption(
+        "Live transaction data from [Mempool.space](https://mempool.space) — "
+        "no API key required."
+    )
+
+    mempool_key = f"mempool_{trans_no}"
+    if mempool_key not in st.session_state:
+        st.session_state[mempool_key] = None
+
+    col_fetch, _ = st.columns([1, 4])
+    if col_fetch.button("Fetch from Mempool.space", key="fetch_mempool"):
+        with st.spinner("Querying Mempool.space…"):
+            st.session_state[mempool_key] = fetch_mempool_tx(trans_no)
+
+    mpdata = st.session_state.get(mempool_key)
+    if mpdata is not None:
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Fee",           f"{mpdata['fee_sats']:,} sats  ({mpdata['fee_btc']:.8f} BTC)")
+        mc2.metric("Fee Rate",      f"{mpdata['fee_rate_sat_vb']} sat/vB")
+        mc3.metric("Size",          f"{mpdata['size_bytes']:,} B  /  {mpdata['vsize_vbytes']} vB")
+        mc4.metric("Confirmed",     "✅ Yes" if mpdata["confirmed"] else "⏳ Pending")
+
+        mc5, mc6, mc7, mc8 = st.columns(4)
+        mc5.metric("Version",       mpdata.get("version", "—"))
+        mc6.metric("Locktime",      mpdata.get("locktime", "—"))
+        mc7.metric("Inputs (live)", mpdata.get("vin_count", "—"))
+        mc8.metric("Outputs (live)",mpdata.get("vout_count", "—"))
+
+        if mpdata.get("block_height"):
+            import datetime
+            bt = mpdata.get("block_time")
+            dt = datetime.datetime.fromtimestamp(bt).strftime("%Y-%m-%d %H:%M UTC") if bt else "—"
+            st.caption(f"Confirmed in block **{mpdata['block_height']:,}** at {dt}")
+
+        st.markdown(
+            f"[🔗 View full details on Mempool.space](https://mempool.space/tx/{trans_no})"
+        )
+    elif st.session_state.get(mempool_key) is None and "fetch_mempool" not in st.session_state:
+        st.info("Click the button above to fetch live transaction data.")
+    else:
+        st.warning(
+            "Transaction not found on Mempool.space. "
+            "It may be too old, or the hash may be from a test dataset."
+        )
+
+# ── Tab 2: Bitcoin Abuse DB ───────────────────────────────────────────────────
+with ext_tab2:
+    st.caption(
+        "Check output addresses against the "
+        "[Bitcoin Abuse Database](https://www.bitcoinabuse.com/api-docs). "
+        "Free API key required — register at bitcoinabuse.com."
+    )
+
+    abuse_key = _get_secret("BITCOIN_ABUSE_KEY")
+    if not abuse_key:
+        st.warning(
+            "No Bitcoin Abuse API key found.  \n"
+            "Add `BITCOIN_ABUSE_KEY = \"your_key\"` to `.streamlit/secrets.toml` and restart."
+        )
+    else:
+        abuse_cache_key = f"abuse_{trans_no}"
+        if st.button("Check Output Addresses", key="check_abuse"):
+            oa_list = []
+            if not grp.empty:
+                oa_list = grp["Output_Address"].dropna().unique().tolist()[:20]  # cap at 20
+            with st.spinner(f"Checking {len(oa_list)} addresses…"):
+                st.session_state[abuse_cache_key] = check_addresses_abuse(oa_list)
+
+        abuse_results = st.session_state.get(abuse_cache_key, {})
+        if abuse_results:
+            any_flagged = any(r.get("count", 0) > 0 for r in abuse_results.values())
+            if any_flagged:
+                st.error("⚠️  One or more output addresses have abuse reports!")
+            else:
+                st.success("✅  No abuse reports found for checked addresses.")
+
+            rows = []
+            for addr, result in abuse_results.items():
+                count = result.get("count", 0)
+                rows.append({
+                    "Address": addr,
+                    "Abuse Reports": count,
+                    "Status": "⚠️ FLAGGED" if count > 0 else "✅ Clean",
+                })
+            ab_df = pd.DataFrame(rows)
+            st.dataframe(ab_df, use_container_width=True)
+        else:
+            st.info("Click the button above to check output addresses.")
+
+# ── Tab 3: Claude AI Analysis ─────────────────────────────────────────────────
+with ext_tab3:
+    st.caption(
+        "Ask Claude (Anthropic's AI) to synthesise all signals and generate a "
+        "forensic risk narrative. Requires an Anthropic API key."
+    )
+
+    claude_key = _get_secret("ANTHROPIC_API_KEY")
+    if not claude_key:
+        st.warning(
+            "No Anthropic API key found.  \n"
+            "Add `ANTHROPIC_API_KEY = \"sk-ant-...\"` to `.streamlit/secrets.toml` and restart."
+        )
+        st.markdown(
+            "Get a key at [console.anthropic.com](https://console.anthropic.com/)"
+        )
+    else:
+        claude_cache_key = f"claude_{trans_no}"
+
+        if st.button("🤖  Generate Claude Analysis", type="primary", key="gen_claude"):
+            with st.spinner("Claude is analysing the transaction…"):
+                analysis = generate_claude_analysis(
+                    feat_row=feat_row,
+                    rules=rules,
+                    prob=prob or 0.0,
+                    block_no=block_no,
+                    trans_no=trans_no,
+                )
+                st.session_state[claude_cache_key] = analysis
+
+        analysis = st.session_state.get(claude_cache_key)
+        if analysis:
+            if analysis.startswith("❌"):
+                st.error(analysis)
+            else:
+                st.markdown(analysis)
+                st.caption(
+                    "⚠️ AI-generated analysis. Claude has no real-time blockchain access — "
+                    "it reasons from the feature values and rule flags provided. "
+                    "Always verify against primary sources before taking compliance action."
+                )
