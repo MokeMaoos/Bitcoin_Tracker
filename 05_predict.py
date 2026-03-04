@@ -12,7 +12,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from utils import is_equal_value, compute_value_entropy, is_peeling, compute_fresh_output_ratio
+from utils import (
+    is_equal_value, compute_value_entropy, is_peeling,
+    compute_fresh_output_ratio, compute_coinjoin_strength,
+)
 
 MODEL_PATH   = "outputs/model.pkl"
 FEATURES_CSV = "outputs/transaction_features.csv"
@@ -40,11 +43,15 @@ def get_features_for_tx(block_no, trans_no, td, tx, ai, wi):
     if grp.empty:
         print(f"[ERROR] Transaction Block {block_no} / Trans {trans_no} not found in data.")
         return None
-    ov = grp["Output_Value"].values
-    oa = grp["Output_Address"].values
+    ov          = grp["Output_Value"].values
+    oa          = grp["Output_Address"].values
+    num_inputs  = grp["Input_Address"].nunique()
+    num_outputs = grp["Output_Address"].nunique()
+    cj_str      = compute_coinjoin_strength(ov, num_inputs, num_outputs)
+
     tx_row = tx[(tx["Block_No"] == block_no) & (tx["Trans_No"] == trans_no)]
     wtx = wsent = wsize = np.nan
-    if not tx_row.empty:
+    if not tx_row.empty and cj_str <= 0.1:
         wid = tx_row["Wallet"].values[0]
         w = wi[wi["Wallet"] == wid]
         if not w.empty:
@@ -52,20 +59,21 @@ def get_features_for_tx(block_no, trans_no, td, tx, ai, wi):
             wsent = w["Total_Sent"].values[0]
             wsize = w["N_Addresses"].values[0]
     return pd.DataFrame([{
-        "num_inputs":          grp["Input_Address"].nunique(),
-        "num_outputs":         grp["Output_Address"].nunique(),
+        "num_inputs":          num_inputs,
+        "num_outputs":         num_outputs,
         "total_input":         grp["Input_Value"].sum(),
         "total_output":        ov.sum(),
         "mean_output":         ov.mean(),
         "std_output":          ov.std() if len(ov) > 1 else 0,
         "max_output":          ov.max(),
         "min_output":          ov.min(),
-        "io_ratio":            grp["Input_Address"].nunique() / max(grp["Output_Address"].nunique(), 1),
+        "io_ratio":            num_inputs / max(num_outputs, 1),
         "value_ratio":         grp["Input_Value"].sum() / max(ov.sum(), 1e-9),
         "equal_value_flag":    is_equal_value(ov),
         "value_entropy":       compute_value_entropy(ov),
         "peeling_flag":        is_peeling(ov),
         "fresh_output_ratio":  compute_fresh_output_ratio(oa, ai),
+        "coinjoin_strength":   cj_str,
         "wallet_total_tx":     wtx,
         "wallet_total_sent":   wsent,
         "wallet_size":         wsize,
@@ -74,7 +82,7 @@ def get_features_for_tx(block_no, trans_no, td, tx, ai, wi):
 def predict_tx(block_no, trans_no):
     model, feature_cols = load_model()
     td, tx, ai, wi = load_data()
-    feat = get_features_for_tx(int(block_no), int(trans_no), td, tx, ai, wi)
+    feat = get_features_for_tx(int(block_no), trans_no, td, tx, ai, wi)
     if feat is None: return
     X = feat[feature_cols].fillna(feat[feature_cols].median())
     prob = model.predict_proba(X)[0][1]
