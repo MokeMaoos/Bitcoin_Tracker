@@ -223,7 +223,9 @@ def rule_evidence(feat_row: dict, grp, ai) -> dict:
 
 def run_live_prediction(block_no, trans_no, td, tx, ai, wi, bundle):
     """
-    Compute transaction features on-the-fly and return (feat_dict, prob).
+    Compute all 38 transaction features on-the-fly and return (feat_dict, prob).
+    Features that require large pre-aggregated files (balance velocity) are
+    left as NaN and imputed by the model's median imputer.
     Returns (None, None) if the transaction is not found in td.
     """
     from utils import (
@@ -241,15 +243,74 @@ def run_live_prediction(block_no, trans_no, td, tx, ai, wi, bundle):
     num_outputs = grp["Output_Address"].nunique()
     cj_str      = compute_coinjoin_strength(ov, num_inputs, num_outputs)
 
+    # ── Wallet features ────────────────────────────────────────────────────────
     tx_row = tx[(tx["Block_No"] == block_no) & (tx["Trans_No"] == trans_no)]
-    wtx = wsent = wsize = np.nan
+    wtx = wsent = wsize = wage = wsent_ratio = wfbal = wbal_ratio = np.nan
     if not tx_row.empty and cj_str <= 0.1:
         wid = tx_row["Wallet"].values[0]
         w   = wi[wi["Wallet"] == wid]
         if not w.empty:
-            wtx   = w["N_Transactions"].values[0]
-            wsent = w["Total_Sent"].values[0]
-            wsize = w["N_Addresses"].values[0]
+            wtx   = w["N_Transactions"].values[0]  if "N_Transactions"  in w.columns else np.nan
+            wsent = w["Total_Sent"].values[0]       if "Total_Sent"      in w.columns else np.nan
+            wsize = w["N_Addresses"].values[0]      if "N_Addresses"     in w.columns else np.nan
+            if "First_Active_Block" in w.columns and "Last_Active_Block" in w.columns:
+                wage = max(0, int(w["Last_Active_Block"].values[0]) - int(w["First_Active_Block"].values[0]))
+            if "N_Sent_Transactions" in w.columns and not np.isnan(wtx) and float(wtx) > 0:
+                wsent_ratio = float(w["N_Sent_Transactions"].values[0]) / float(wtx)
+            if "Final_Balance" in w.columns:
+                wfbal = float(w["Final_Balance"].values[0])
+            if "Final_Balance" in w.columns and "Total_Received" in w.columns:
+                tr = float(w["Total_Received"].values[0]) or 1.0
+                wbal_ratio = min(1.0, max(0.0, float(w["Final_Balance"].values[0]) / tr))
+
+    # ── Transaction metadata ───────────────────────────────────────────────────
+    tx_fee = lock_time_flag = tx_hour = tx_day = is_night = np.nan
+    if not tx_row.empty:
+        if "Fees" in tx_row.columns:
+            tx_fee = float(pd.to_numeric(tx_row["Fees"].values[0], errors="coerce") or np.nan)
+        lock_raw       = tx_row["Lock_Time"].values[0] if "Lock_Time" in tx_row.columns else 0
+        lock_time_flag = int(float(lock_raw or 0) > 0)
+        if "DT" in tx_row.columns and "TM" in tx_row.columns:
+            try:
+                dt_str = str(tx_row["DT"].values[0]) + " " + str(tx_row["TM"].values[0])
+                dt_obj = pd.to_datetime(dt_str, dayfirst=True, errors="coerce")
+                if not pd.isna(dt_obj):
+                    tx_hour  = int(dt_obj.hour)
+                    tx_day   = int(dt_obj.dayofweek)
+                    is_night = int(0 <= dt_obj.hour < 6)
+            except Exception:
+                pass
+
+    # ── Output-address static features ────────────────────────────────────────
+    adr_col = next((c for c in ("ADR", "Address", "address") if c in ai.columns), ai.columns[0])
+    try:
+        ai_idx = ai.set_index(adr_col)
+    except Exception:
+        ai_idx = ai.set_index(ai.columns[0])
+
+    tx_cnts, balances, ages, sent_ratios, zero_flags = [], [], [], [], []
+    for a in oa:
+        if a in ai_idx.index:
+            r = ai_idx.loc[a]
+            tx_cnts.append(float(r.get("N_Transactions", np.nan)))
+            balances.append(float(r.get("Final_Balance",  np.nan)))
+            fa = r.get("First_Active_Block", np.nan)
+            la = r.get("Last_Active_Block",  np.nan)
+            ages.append(float(la - fa) if not (pd.isna(fa) or pd.isna(la)) else np.nan)
+            ts = r.get("Total_Sent",     np.nan)
+            tr = r.get("Total_Received", np.nan)
+            sent_ratios.append(float(ts) / max(float(tr), 1.0)
+                               if not (pd.isna(ts) or pd.isna(tr)) else np.nan)
+            fb = float(r.get("Final_Balance", np.nan))
+            zero_flags.append(0.0 if pd.isna(fb) else float(fb == 0))
+
+    def _safe_mean(lst):
+        vals = [v for v in lst if not (isinstance(v, float) and np.isnan(v))]
+        return float(np.mean(vals)) if vals else np.nan
+
+    # ── Graph topology ─────────────────────────────────────────────────────────
+    n_in_wallets  = grp["Input_Wallet"].nunique()  if "Input_Wallet"  in grp.columns else np.nan
+    n_out_wallets = grp["Output_Wallet"].nunique() if "Output_Wallet" in grp.columns else np.nan
 
     feat = {
         "num_inputs":          num_inputs,
@@ -267,16 +328,37 @@ def run_live_prediction(block_no, trans_no, td, tx, ai, wi, bundle):
         "peeling_flag":        is_peeling(ov),
         "fresh_output_ratio":  compute_fresh_output_ratio(oa, ai),
         "coinjoin_strength":   cj_str,
-        "wallet_total_tx":     wtx,
-        "wallet_total_sent":   wsent,
-        "wallet_size":         wsize,
+        "n_distinct_input_wallets":  n_in_wallets,
+        "n_distinct_output_wallets": n_out_wallets,
+        "wallet_total_tx":       wtx,
+        "wallet_total_sent":     wsent,
+        "wallet_size":           wsize,
+        "wallet_age":            wage,
+        "wallet_sent_ratio":     wsent_ratio,
+        "wallet_final_balance":  wfbal,
+        "wallet_balance_ratio":  wbal_ratio,
+        "wallet_balance_velocity": np.nan,  # requires Wallet_Balance_Block; model imputes
+        "wallet_balance_range":    np.nan,
+        "wallet_balance_std":      np.nan,
+        "tx_fee":            tx_fee,
+        "tx_fee_normalized": np.nan,        # requires Block_Header lookup; model imputes
+        "lock_time_flag":    lock_time_flag,
+        "tx_hour":           tx_hour,
+        "tx_day_of_week":    tx_day,
+        "is_night":          is_night,
+        "mean_out_addr_tx_count":     _safe_mean(tx_cnts),
+        "mean_out_addr_balance":      _safe_mean(balances),
+        "frac_out_addr_zero_balance": _safe_mean(zero_flags),
+        "mean_out_addr_age":          _safe_mean(ages),
+        "mean_out_addr_sent_ratio":   _safe_mean(sent_ratios),
+        "mean_out_addr_bal_velocity": np.nan,  # requires Address_Balance_Block; model imputes
     }
 
-    model  = bundle["model"]
-    fcols  = bundle["features"]
+    model   = bundle["model"]
+    fcols   = bundle["features"]
     feat_df = pd.DataFrame([feat])
-    X      = feat_df[fcols].fillna(feat_df[fcols].median())
-    prob   = float(model.predict_proba(X)[0][1])
+    X       = feat_df.reindex(columns=fcols).fillna(feat_df.reindex(columns=fcols).median())
+    prob    = float(model.predict_proba(X)[0][1])
     return feat, prob
 
 

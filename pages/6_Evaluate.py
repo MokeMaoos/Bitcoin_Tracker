@@ -85,12 +85,18 @@ st.success(f"Results loaded from `outputs/elliptic_eval.json`  —  {res.get('da
 st.divider()
 
 # ── Feature set selector ───────────────────────────────────────────────────────
-feat_set = st.radio(
-    "Feature set",
-    ["Local features only (93)", "All features (166)"],
-    horizontal=True,
-)
-key = "local_features" if "Local" in feat_set else "all_features"
+feat_options = ["Local features only (93)", "All features (166)"]
+if res.get("rf_local_features"):
+    feat_options.append("RF baseline — local features (comparison)")
+
+feat_set = st.radio("Feature set", feat_options, horizontal=True)
+
+if "RF baseline" in feat_set:
+    key = "rf_local_features"
+elif "Local" in feat_set:
+    key = "local_features"
+else:
+    key = "all_features"
 data = res.get(key, {})
 
 if not data:
