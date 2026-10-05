@@ -1,13 +1,24 @@
 """
-03_label.py — rule-based pseudo-labelling of transactions.
+03_label.py — rule-based pseudo-labelling with confirmed-label priority.
 
 Operationalises FATF red-flag indicators (FATF, 2020) into a suspicion
 score and assigns pseudo-labels for downstream supervised learning.
 
-Label scheme:
-     1 = suspected illicit  (>= 2 red flags fired)
-     0 = suspected licit    (0 red flags fired)
-    -1 = uncertain          (exactly 1 red flag fired)
+Label priority:
+    1.  If a transaction's addresses were matched to an external confirmed
+        source by 02b_enrich_labels.py, the confirmed label is used directly.
+    2.  Otherwise, the FATF rule-based pseudo-label is applied as fallback.
+
+Label scheme (pseudo_label column):
+     1 = illicit  (confirmed illicit, or >= 2 red flags fired)
+     0 = licit    (confirmed licit, or 0 red flags fired)
+    -1 = uncertain (exactly 1 red flag fired, no confirmed match)
+
+New column:
+    label_type — "confirmed" if derived from an external source, "pseudo" otherwise.
+
+Reads from: outputs/enriched_features.csv  (if present, produced by 02b_enrich_labels.py)
+            outputs/transaction_features.csv  (fallback if enrichment was skipped)
 
 Produces: outputs/labeled_features.csv
 
@@ -20,9 +31,10 @@ import sys
 import numpy as np
 import pandas as pd
 
-OUTPUT_DIR   = "outputs"
-FEATURES_CSV = os.path.join(OUTPUT_DIR, "transaction_features.csv")
-OUT_CSV      = os.path.join(OUTPUT_DIR, "labeled_features.csv")
+OUTPUT_DIR        = "outputs"
+ENRICHED_CSV      = os.path.join(OUTPUT_DIR, "enriched_features.csv")
+FEATURES_CSV      = os.path.join(OUTPUT_DIR, "transaction_features.csv")
+OUT_CSV           = os.path.join(OUTPUT_DIR, "labeled_features.csv")
 
 # ── Rule thresholds ──────────────────────────────────────────────────────────
 # Each threshold maps a FATF red-flag concept to a measurable boundary.
@@ -65,28 +77,80 @@ def apply_rules(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def apply_confirmed_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Overlay confirmed external labels onto the pseudo-labelled DataFrame.
+
+    If the ``confirmed_label`` column is present (written by 02b_enrich_labels.py),
+    it takes priority over the pseudo-label for rows where it is not NaN.
+
+    Adds a ``label_type`` column: "confirmed" or "pseudo".
+    """
+    df = df.copy()
+
+    if "confirmed_label" not in df.columns:
+        df["label_type"] = "pseudo"
+        return df
+
+    confirmed_mask = df["confirmed_label"].notna()
+
+    # Override pseudo_label with confirmed_label where available
+    df.loc[confirmed_mask, "pseudo_label"] = (
+        df.loc[confirmed_mask, "confirmed_label"].astype(int)
+    )
+
+    df["label_type"] = "pseudo"
+    df.loc[confirmed_mask, "label_type"] = "confirmed"
+
+    return df
+
+
 if __name__ == "__main__":
     print("=" * 55)
     print("  Bitcoin Illicit Detection — Rule-Based Labelling")
     print("=" * 55 + "\n")
 
-    if not os.path.exists(FEATURES_CSV):
+    # Prefer enriched feature matrix; fall back to raw features if enrichment
+    # was skipped (e.g., run with --skip-enrichment in run_pipeline.py).
+    if os.path.exists(ENRICHED_CSV):
+        src_csv = ENRICHED_CSV
+    elif os.path.exists(FEATURES_CSV):
+        print(f"[INFO] Enriched features not found; falling back to {FEATURES_CSV}")
+        print("       Run 02b_enrich_labels.py to enable confirmed-label priority.\n")
+        src_csv = FEATURES_CSV
+    else:
         print(f"[ERROR] Features file not found: {FEATURES_CSV}")
         print("  Run 02_feature.py first.")
         sys.exit(1)
 
-    df = pd.read_csv(FEATURES_CSV)
-    print(f"Loaded {len(df):,} transactions from {FEATURES_CSV}\n")
+    df = pd.read_csv(src_csv)
+    print(f"Loaded {len(df):,} transactions from {src_csv}\n")
 
     df = apply_rules(df)
+    df = apply_confirmed_labels(df)
 
-    # ── Label distribution ───────────────────────────────────────────────────
-    total  = len(df)
-    counts = df["pseudo_label"].value_counts().sort_index()
-    print("── Pseudo-label distribution ────────────────────────")
-    for lbl, n in counts.items():
-        name = {1: "Illicit", 0: "Licit", -1: "Uncertain"}[lbl]
-        print(f"  {name:10s} ({lbl:2d}) : {n:>8,}  ({n / total:.1%})")
+    total = len(df)
+
+    # ── Label type breakdown ─────────────────────────────────────────────────
+    if "label_type" in df.columns and df["label_type"].eq("confirmed").any():
+        n_conf = int(df["label_type"].eq("confirmed").sum())
+        conf_ill  = int(((df["label_type"]=="confirmed") & (df["pseudo_label"]==1)).sum())
+        conf_lit  = int(((df["label_type"]=="confirmed") & (df["pseudo_label"]==0)).sum())
+        pseudo_ill = int(((df["label_type"]=="pseudo") & (df["pseudo_label"]==1)).sum())
+        pseudo_lit = int(((df["label_type"]=="pseudo") & (df["pseudo_label"]==0)).sum())
+        uncertain  = int((df["pseudo_label"] == -1).sum())
+        print("── Label distribution ───────────────────────────────")
+        print(f"  Confirmed illicit   : {conf_ill:>8,}")
+        print(f"  Confirmed licit     : {conf_lit:>8,}")
+        print(f"  Pseudo illicit      : {pseudo_ill:>8,}")
+        print(f"  Pseudo licit        : {pseudo_lit:>8,}")
+        print(f"  Uncertain (pseudo)  : {uncertain:>8,}")
+    else:
+        print("── Pseudo-label distribution ────────────────────────")
+        counts = df["pseudo_label"].value_counts().sort_index()
+        for lbl, n in counts.items():
+            name = {1: "Illicit", 0: "Licit", -1: "Uncertain"}[lbl]
+            print(f"  {name:10s} ({lbl:2d}) : {n:>8,}  ({n / total:.1%})")
 
     # ── Rule firing rates ────────────────────────────────────────────────────
     rule_cols = [c for c in df.columns if c.startswith("rule_")]

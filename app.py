@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ui_utils import (
     load_labeled, load_clusters, load_model_bundle,
     RULE_META, LABEL_MAP, LABEL_COLORS, OUTPUT_DIR,
+    DEMO_MODE, DEMO_TOTALS,
 )
 
 st.set_page_config(
@@ -43,10 +44,19 @@ if df is None:
     st.stop()
 
 # ── Metric cards ───────────────────────────────────────────────────────────────
-total     = len(df)
-illicit   = int((df["pseudo_label"] == 1).sum())
-licit     = int((df["pseudo_label"] == 0).sum())
-uncertain = int((df["pseudo_label"] == -1).sum())
+# In demo mode the loaded df is a 5,000-row stratified sample for fast
+# rendering; the displayed counts come from DEMO_TOTALS so they continue
+# to reflect the full 8.34 M-row pipeline run.
+if DEMO_MODE:
+    total     = DEMO_TOTALS["total"]
+    illicit   = DEMO_TOTALS["illicit"]
+    licit     = DEMO_TOTALS["licit"]
+    uncertain = DEMO_TOTALS["uncertain"]
+else:
+    total     = len(df)
+    illicit   = int((df["pseudo_label"] == 1).sum())
+    licit     = int((df["pseudo_label"] == 0).sum())
+    uncertain = int((df["pseudo_label"] == -1).sum())
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total Transactions", f"{total:,}")
@@ -88,7 +98,10 @@ with col1:
 
 with col2:
     st.subheader("Suspicion Score Distribution")
-    score_counts = df["suspicion_score"].value_counts().sort_index()
+    if DEMO_MODE:
+        score_counts = pd.Series(DEMO_TOTALS["suspicion_score"]).sort_index()
+    else:
+        score_counts = df["suspicion_score"].value_counts().sort_index()
     fig2 = px.bar(
         x=score_counts.index, y=score_counts.values,
         labels={"x": "Suspicion Score (rules fired)", "y": "Transactions"},
@@ -113,7 +126,10 @@ with col3:
     st.subheader("Rule Firing Rates")
     rule_cols   = [c for c in df.columns if c.startswith("rule_") and c in RULE_META]
     rule_labels = [RULE_META[c]["label"] for c in rule_cols]
-    rule_counts = [int(df[c].sum()) for c in rule_cols]
+    if DEMO_MODE:
+        rule_counts = [DEMO_TOTALS["rule_firing"][c] for c in rule_cols]
+    else:
+        rule_counts = [int(df[c].sum()) for c in rule_cols]
     rule_pcts   = [n / total for n in rule_counts]
 
     fig3 = px.bar(

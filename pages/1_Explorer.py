@@ -77,10 +77,29 @@ if active_rules:
     mask = mask & df[active_rules].any(axis=1)
 
 filtered = df[mask]
-st.caption(
-    f"Showing **{min(len(filtered), max_rows):,}** of **{len(filtered):,}** "
-    f"matching transactions (total dataset: {len(df):,})"
-)
+
+# Demo mode: scale "of N matching" and "total dataset" up to the full
+# 8.34 M-row pipeline run so the displayed counts match Section 3.
+try:
+    from ui_utils import DEMO_MODE, DEMO_TOTALS
+except ImportError:
+    DEMO_MODE = False
+    DEMO_TOTALS = {}
+
+if DEMO_MODE:
+    scale = DEMO_TOTALS["total"] / max(len(df), 1)
+    n_match_scaled = int(len(filtered) * scale)
+    total_display  = DEMO_TOTALS["total"]
+    st.caption(
+        f"Showing **{min(len(filtered), max_rows):,}** of "
+        f"**{n_match_scaled:,}** matching transactions "
+        f"(total dataset: {total_display:,})"
+    )
+else:
+    st.caption(
+        f"Showing **{min(len(filtered), max_rows):,}** of **{len(filtered):,}** "
+        f"matching transactions (total dataset: {len(df):,})"
+    )
 
 # ── Build display table ────────────────────────────────────────────────────────
 show_cols = (

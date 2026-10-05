@@ -26,6 +26,7 @@ Usage:
 import os
 import sys
 import time
+from typing import Optional
 import numpy as np
 import pandas as pd
 
@@ -68,7 +69,7 @@ def load_block_header():
 
 
 def _chunked_balance_agg(path: str, id_col: str, id_dtype,
-                          chunk_size: int = 1_500_000) -> pd.DataFrame | None:
+                          chunk_size: int = 1_500_000) -> Optional[pd.DataFrame]:
     """
     Stream-aggregate a large balance time-series CSV without loading it all into RAM.
 
@@ -321,10 +322,16 @@ def build_features(td, tx, ai, wi, bh=None, wallet_temporal=None, addr_temporal=
 
     if "DT" in tx_meta.columns and "TM" in tx_meta.columns:
         try:
+            # Date format auto-detected: the reference dataset uses
+            # DD/MM/YYYY, the multi-period CUBiD dataset uses YYYY/MM/DD.
+            # Both are unambiguous (the year is always 4 digits), so we let
+            # pandas infer the format rather than forcing dayfirst=True
+            # (which silently mis-parses the YYYY/MM/DD form).
             dt_parsed = pd.to_datetime(
                 tx_meta["DT"].astype(str) + " " + tx_meta["TM"].astype(str),
-                dayfirst=True, errors="coerce",
+                errors="coerce", format="mixed",
             )
+            tx_meta["tx_datetime"]    = dt_parsed
             tx_meta["tx_hour"]        = dt_parsed.dt.hour.astype("Int16")
             tx_meta["tx_day_of_week"] = dt_parsed.dt.dayofweek.astype("Int16")
             tx_meta["is_night"]       = ((dt_parsed.dt.hour >= 0) & (dt_parsed.dt.hour < 6)).astype(int)
@@ -338,6 +345,7 @@ def build_features(td, tx, ai, wi, bh=None, wallet_temporal=None, addr_temporal=
         tx_meta["tx_fee_normalized"] = np.nan
 
     tx_keep = KEYS + [c for c in [
+        "tx_datetime",
         "tx_fee", "tx_fee_normalized", "lock_time_flag",
         "tx_hour", "tx_day_of_week", "is_night",
     ] if c in tx_meta.columns]

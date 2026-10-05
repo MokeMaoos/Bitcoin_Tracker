@@ -1,7 +1,19 @@
+# Data and outputs (kept off GitHub)
 data/
+data_2021/
+data_demo/
 outputs/
+outputs_2021_backup/
 *.csv
 *.pkl
+*.parquet
+*.joblib
+*.xlsx
+
+# Python
 __pycache__/
+.venv/
+
+# Secrets / OS
 .streamlit/secrets.toml
-context
+.DS_Store

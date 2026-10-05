@@ -3,18 +3,31 @@
 
 Staged pipeline (methodology §6.4):
     1. Unsupervised clustering (K-Means + DBSCAN) on all transactions
-    2. Supervised classification on pseudo-labeled transactions
+    2. Supervised classification on labelled transactions
        — LightGBM (primary, if installed) or Random Forest (fallback)
     3. 5-fold stratified cross-validation (precision, recall, F1)
-    4. Save model bundle → outputs/model.pkl
+    4. Save model bundle → outputs/model_<mode>.pkl
        Save cluster assignments → outputs/cluster_assignments.csv
+
+Label modes (--label-mode):
+    hybrid         — use confirmed labels where available, pseudo-labels elsewhere
+                     (default when confirmed labels are present in the data)
+    pseudo_only    — use only pseudo-labels (original behaviour; default when
+                     no confirmed labels are present)
+    confirmed_only — train exclusively on rows where label_type == "confirmed"
+                     (warns if fewer than 100 illicit confirmed examples)
 
 Usage:
     python 04_train.py
+    python 04_train.py --label-mode confirmed_only
+    python 04_train.py --label-mode pseudo_only
+    python 04_train.py --label-mode hybrid
 """
 
+import argparse
 import os
 import sys
+import time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -38,8 +51,10 @@ except ImportError:
 
 OUTPUT_DIR   = "outputs"
 LABELED_CSV  = os.path.join(OUTPUT_DIR, "labeled_features.csv")
-MODEL_PATH   = os.path.join(OUTPUT_DIR, "model.pkl")
 CLUSTER_CSV  = os.path.join(OUTPUT_DIR, "cluster_assignments.csv")
+
+_VALID_MODES = ("hybrid", "pseudo_only", "confirmed_only")
+_MIN_ILLICIT_CONFIRMED = 100  # warn if confirmed_only has fewer illicit examples
 
 # All 38 features produced by 02_feature.py
 # Original 18 + 20 new features from unused CSVs
@@ -67,15 +82,67 @@ FEATURE_COLS = [
     "mean_out_addr_sent_ratio", "mean_out_addr_bal_velocity",
 ]
 
-RANDOM_STATE  = 42
-DBSCAN_SAMPLE = 10_000
+RANDOM_STATE = 42
+# DBSCAN now runs on the full transaction set — the previous 10,000-row
+# sampling restriction was dropped (it produced cluster sizes of ≤14 and
+# left ~96 % of rows tagged with a -2 sentinel).  Memory and time are not
+# constrained for this evaluation.
+DBSCAN_EPS         = 1.5
+DBSCAN_MIN_SAMPLES = 5
+DBSCAN_ALGORITHM   = "ball_tree"  # O(n log n) for moderate dimensionality
 
 
-def load_data(path: str):
-    df      = pd.read_csv(path)
-    labeled = df[df["pseudo_label"] != -1].copy()
+def load_data(path: str, label_mode: str):
+    """
+    Load and filter the labeled feature matrix according to *label_mode*.
+
+    Returns (all_tx, training_subset) where training_subset is the set of rows
+    used for supervised learning.
+    """
+    df = pd.read_csv(path)
+
+    has_confirmed = (
+        "label_type" in df.columns
+        and df["label_type"].eq("confirmed").any()
+    )
+
     print(f"  Total transactions           : {len(df):,}")
-    print(f"  Labeled (excl. uncertain)    : {len(labeled):,}")
+    print(f"  Has confirmed labels         : {has_confirmed}")
+
+    if label_mode == "hybrid":
+        # All rows with a definitive label (confirmed or pseudo, but not uncertain)
+        labeled = df[df["pseudo_label"] != -1].copy()
+
+    elif label_mode == "pseudo_only":
+        # Exclude confirmed rows entirely — use only FATF pseudo-labels
+        if has_confirmed:
+            labeled = df[
+                (df["pseudo_label"] != -1) &
+                (df.get("label_type", pd.Series("pseudo", index=df.index)) != "confirmed")
+            ].copy()
+        else:
+            labeled = df[df["pseudo_label"] != -1].copy()
+
+    elif label_mode == "confirmed_only":
+        if not has_confirmed:
+            print("[ERROR] --label-mode confirmed_only requested but no confirmed "
+                  "labels are present in the data.")
+            print("  Run 02b_enrich_labels.py and 03_label.py first.")
+            sys.exit(1)
+        labeled = df[df["label_type"] == "confirmed"].copy()
+        n_ill = int((labeled["pseudo_label"] == 1).sum())
+        if n_ill < _MIN_ILLICIT_CONFIRMED:
+            print(f"[WARN] Only {n_ill} confirmed illicit examples available "
+                  f"(threshold: {_MIN_ILLICIT_CONFIRMED}).  "
+                  "Cross-validation metrics may be unreliable with so few positives.")
+
+    else:
+        print(f"[ERROR] Unknown label mode: {label_mode!r}.  "
+              f"Choose from: {_VALID_MODES}")
+        sys.exit(1)
+
+    print(f"  Label mode                   : {label_mode}")
+    print(f"  Training rows                : {len(labeled):,}")
     print(f"    Illicit (pseudo_label = 1) : {(labeled['pseudo_label'] == 1).sum():,}")
     print(f"    Licit   (pseudo_label = 0) : {(labeled['pseudo_label'] == 0).sum():,}")
     return df, labeled
@@ -127,7 +194,15 @@ def build_classifier():
 
 def run_clustering(all_tx: pd.DataFrame, feat_cols: list,
                    imp: SimpleImputer, scaler=None):
-    """Apply K-Means and DBSCAN to the full transaction set."""
+    """
+    Apply K-Means and DBSCAN to the full transaction set.
+
+    DBSCAN was previously run on a 10,000-row sample due to a memory
+    restriction; it is now run on the full feature matrix (eps=1.5,
+    min_samples=5, ball_tree).  Every row in the output therefore has a
+    real DBSCAN cluster id (or the noise label -1) — no -2 sentinel is
+    written.
+    """
     X_imp = imp.transform(all_tx[feat_cols])
     X_scaled = scaler.transform(X_imp) if scaler is not None else X_imp
 
@@ -135,21 +210,26 @@ def run_clustering(all_tx: pd.DataFrame, feat_cols: list,
     km        = KMeans(n_clusters=3, random_state=RANDOM_STATE, n_init=10)
     km_labels = km.fit_predict(X_scaled)
 
-    n_sample = min(DBSCAN_SAMPLE, len(X_scaled))
-    rng      = np.random.default_rng(RANDOM_STATE)
-    idx      = rng.choice(len(X_scaled), size=n_sample, replace=False)
+    print(f"  Running DBSCAN on full set "
+          f"({len(X_scaled):,} rows, eps={DBSCAN_EPS}, "
+          f"min_samples={DBSCAN_MIN_SAMPLES}, algorithm={DBSCAN_ALGORITHM!r})...")
+    t0 = time.time()
+    db        = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES,
+                       algorithm=DBSCAN_ALGORITHM, n_jobs=-1)
+    db_labels = db.fit_predict(X_scaled)
+    elapsed = time.time() - t0
 
-    print(f"  Running DBSCAN on {n_sample:,}-tx sample (eps=1.5, min_samples=5)...")
-    db             = DBSCAN(eps=1.5, min_samples=5)
-    db_sample_lbls = db.fit_predict(X_scaled[idx])
-
-    n_clusters = len(set(db_sample_lbls)) - (1 if -1 in db_sample_lbls else 0)
-    n_outliers = int((db_sample_lbls == -1).sum())
+    cluster_ids = sorted(set(db_labels) - {-1})
+    n_clusters  = len(cluster_ids)
+    n_noise     = int((db_labels == -1).sum())
     print(f"    DBSCAN clusters : {n_clusters}")
-    print(f"    DBSCAN outliers : {n_outliers:,}  ({n_outliers/n_sample:.1%})")
-
-    db_labels      = np.full(len(X_scaled), -2, dtype=int)
-    db_labels[idx] = db_sample_lbls
+    print(f"    DBSCAN noise    : {n_noise:,}  ({n_noise/len(db_labels):.1%})")
+    if n_clusters:
+        sizes = pd.Series(db_labels[db_labels != -1]).value_counts().head(5)
+        print("    Largest 5 clusters (id, size):")
+        for cid, sz in sizes.items():
+            print(f"      cluster {int(cid):>4}: {int(sz):>10,}")
+    print(f"    DBSCAN runtime  : {elapsed:.1f} s")
 
     result = all_tx[["Block_No", "Trans_No"]].copy()
     result["cluster_kmeans"] = km_labels
@@ -201,6 +281,23 @@ def train_supervised(labeled: pd.DataFrame, feat_cols: list):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train the illicit-transaction detection model."
+    )
+    parser.add_argument(
+        "--label-mode",
+        choices=list(_VALID_MODES),
+        default=None,
+        help=(
+            "Which labels to train on.  "
+            "'hybrid' uses confirmed labels where available and pseudo-labels "
+            "elsewhere (default when confirmed labels are present).  "
+            "'pseudo_only' uses only FATF pseudo-labels (original behaviour).  "
+            "'confirmed_only' trains exclusively on externally confirmed rows."
+        ),
+    )
+    args = parser.parse_args()
+
     print("=" * 55)
     print("  Bitcoin Illicit Detection — Model Training")
     print(f"  Classifier: {'LightGBM' if USE_LGBM else 'Random Forest'}")
@@ -213,8 +310,26 @@ if __name__ == "__main__":
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # Determine default label mode from the data
+    _probe = pd.read_csv(LABELED_CSV, usecols=lambda c: c == "label_type", nrows=0)
+    _has_label_type = "label_type" in _probe.columns
+    if not _has_label_type:
+        # label_type column absent → enrichment was skipped
+        _has_confirmed = False
+    else:
+        _peek = pd.read_csv(LABELED_CSV, usecols=["label_type"])
+        _has_confirmed = _peek["label_type"].eq("confirmed").any()
+
+    if args.label_mode is None:
+        label_mode = "hybrid" if _has_confirmed else "pseudo_only"
+        print(f"[INFO] --label-mode not specified; auto-selected: {label_mode!r}")
+    else:
+        label_mode = args.label_mode
+
+    model_path = os.path.join(OUTPUT_DIR, f"model_{label_mode}.pkl")
+
     print("Loading data...")
-    all_tx, labeled = load_data(LABELED_CSV)
+    all_tx, labeled = load_data(LABELED_CSV, label_mode)
 
     if labeled["pseudo_label"].nunique() < 2:
         print("[ERROR] Labeled set contains only one class — cannot train.")
@@ -232,12 +347,22 @@ if __name__ == "__main__":
     print(f"  Cluster assignments saved → {CLUSTER_CSV}")
 
     bundle = {
-        "model":    pipeline,
-        "features": feat_cols,
-        "km_model": km_model,
+        "model":      pipeline,
+        "features":   feat_cols,
+        "km_model":   km_model,
         "classifier": "lightgbm" if USE_LGBM else "random_forest",
+        "label_mode": label_mode,
     }
-    joblib.dump(bundle, MODEL_PATH)
-    print(f"\n[OK] Model bundle saved → {MODEL_PATH}")
+    joblib.dump(bundle, model_path)
+    # Also write the canonical model.pkl so that 05_predict.py (which uses a
+    # hard-coded path) always has an up-to-date model to load.
+    canonical_path = os.path.join(OUTPUT_DIR, "model.pkl")
+    joblib.dump(bundle, canonical_path)
+    print(f"\n[OK] Model bundle saved → {model_path}")
+    print(f"     Canonical copy  → {canonical_path}")
+    print(f"     Label mode   : {label_mode}")
     print(f"     Features used: {len(feat_cols)}")
     print(f"     Classifier   : {'LightGBM' if USE_LGBM else 'Random Forest'}")
+    print(f"\n  Predict with:")
+    print(f"    python 05_predict.py --wallet <wallet_id>")
+    print(f"    python 05_predict.py --tx <block_no> <trans_no>")

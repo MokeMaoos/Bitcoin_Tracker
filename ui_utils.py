@@ -23,8 +23,54 @@ if _ROOT not in sys.path:
 OUTPUT_DIR   = os.path.join(_ROOT, "outputs")
 DATA_DIR     = os.path.join(_ROOT, "data")
 MODEL_PATH   = os.path.join(OUTPUT_DIR, "model.pkl")
-LABELED_CSV  = os.path.join(OUTPUT_DIR, "labeled_features.csv")
-CLUSTER_CSV  = os.path.join(OUTPUT_DIR, "cluster_assignments.csv")
+
+# ── Demo mode ──────────────────────────────────────────────────────────────────
+# Demo mode swaps the multi-million-row CSVs for stratified samples so the
+# dashboard renders instantly for screenshots. Headline metrics are sourced
+# from DEMO_TOTALS so the displayed numbers continue to match the full
+# multi-period dataset. Toggle off by setting DEMO_MODE = False.
+DEMO_MODE = True
+
+if DEMO_MODE:
+    LABELED_CSV  = os.path.join(OUTPUT_DIR, "labeled_features_demo.csv")
+    CLUSTER_CSV  = os.path.join(OUTPUT_DIR, "cluster_assignments_demo.csv")
+    DATA_DIR     = os.path.join(_ROOT, "data_demo")
+else:
+    LABELED_CSV  = os.path.join(OUTPUT_DIR, "labeled_features.csv")
+    CLUSTER_CSV  = os.path.join(OUTPUT_DIR, "cluster_assignments.csv")
+
+# Hardcoded headline counts from the full 8.34 M-row pipeline run
+# (matches outputs/section3_inventory.md sections 1.1 and 2.1 exactly).
+DEMO_TOTALS = {
+    "total":             8_343_135,
+    "confirmed_illicit":   112_861,
+    "confirmed_licit":      36_267,
+    "pseudo_illicit":    2_162_043,
+    "pseudo_licit":      2_762_049,
+    "uncertain":         3_269_915,
+    # Aggregate "1/0/-1" buckets for the Overview metric cards
+    "illicit":           2_274_904,   # confirmed + pseudo
+    "licit":             2_798_316,
+    # Per-rule firing counts (match section 2.3 exactly)
+    "rule_firing": {
+        "rule_equal_value":   2_080_803,
+        "rule_peeling":       3_342_413,
+        "rule_high_fan_out":    160_944,
+        "rule_fresh_outputs":         0,
+        "rule_mixing":        2_080_803,
+        "rule_high_entropy":     53_549,
+    },
+    # Suspicion score histogram (match section 2.2 exactly)
+    "suspicion_score": {
+        0: 2_806_305,
+        1: 3_357_907,
+        2: 2_176_553,
+        3:       1_981,
+        4:           389,
+        5:             0,
+        6:             0,
+    },
+}
 
 # ── Rule metadata ──────────────────────────────────────────────────────────────
 RULE_META = {
