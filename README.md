@@ -7,7 +7,7 @@ Regulators spot money laundering on Bitcoin with qualitative red flags that rely
 ## Results
 
 - **35 features** derived from the six FATF red flags, computed over **8.3M transactions** in **24 quarterly snapshots (2019–2024)**.
-- **0.96 macro F1** on a balanced set of **149,128 confirmed labels** (0.93 on the natural distribution), about 12 points above the strongest combined rule baseline.
+- **0.96 macro F1** on a balanced evaluation set of **225,722 transactions**: the **149,128 confirmed labels** plus a sample of unmatched transactions presumed licit. **0.93** on the confirmed labels alone. Roughly 12 points above the strongest combined rule baseline.
 - Matched or exceeded published results on the **Elliptic++** benchmark.
 - **The rules tracked enforcement history.** Mixing-related flags rose from 13.5% in early 2019 to 58.6% in Q3 2023, about a year after the Tornado Cash sanctions, then fell to 7.5% by Q3 2024 as Samourai and Wasabi faced enforcement.
 - **Scope limit:** the method is strongest on obfuscation-heavy laundering and weaker on illicit activity that leaves no structural pattern, such as gambling or blackmail.
